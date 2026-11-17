@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import wave
 from pathlib import Path
+import shutil
 
 import pyaudio
 
@@ -67,6 +68,58 @@ if not PIPER_MODEL_PATH.exists():
         f"Piper voice not found: {PIPER_MODEL_PATH}"
     )
 
+# ==========================================
+# SYSTEM AUDIO ROUTING
+# ==========================================
+
+def pulse_audio_available():
+    """
+    Check whether PulseAudio or PipeWire-Pulse
+    is running.
+
+    Both support system-default audio routing.
+    """
+
+    if not shutil.which("pactl"):
+        return False
+
+    try:
+        result = subprocess.run(
+            ["pactl", "info"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        return result.returncode == 0
+
+    except Exception:
+        return False
+
+
+def get_default_audio_devices():
+
+    if pulse_audio_available():
+
+        try:
+            source = subprocess.check_output(
+                ["pactl", "get-default-source"],
+                text=True
+            ).strip()
+
+            sink = subprocess.check_output(
+                ["pactl", "get-default-sink"],
+                text=True
+            ).strip()
+
+            print("\nSystem default microphone:", source)
+            print("System default speaker:", sink)
+
+        except Exception as error:
+            print("Could not identify PulseAudio devices:", error)
+
+    else:
+        print("\nUsing ALSA/PyAudio system defaults.")
 
 # ==========================================
 # GEMINI PERSONALITY
@@ -240,99 +293,150 @@ def show_audio_devices():
 
 def listen():
 
-    audio = pyaudio.PyAudio()
-
+    audio = None
     stream = None
+    pulse_process = None
+
     transcript = ""
 
     print("\nPadton is listening...")
 
     try:
 
-        # Always use Raspberry Pi's system-default input.
-
-        default_input = (
-            audio.get_default_input_device_info()
-        )
-
-        input_sample_rate = int(
-            default_input["defaultSampleRate"]
-        )
-
-        print(
-            "Using default microphone:",
-            default_input["name"]
-        )
-
-        # Initialize Vosk at 16 kHz.
-
         recognizer = KaldiRecognizer(
             vosk_model,
             VOSK_SAMPLE_RATE
         )
 
-        # Open default input without specifying
-        # an input_device_index.
+        use_pulse = pulse_audio_available()
 
-        stream = audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=input_sample_rate,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
+        if use_pulse:
 
-        start_time = time.monotonic()
+            print("Using system-default microphone (PulseAudio/PipeWire)")
 
-        resample_state = None
-
-        while (
-            time.monotonic() - start_time
-            < MAX_LISTEN_SECONDS
-        ):
-
-            data = stream.read(
-                CHUNK_SIZE,
-                exception_on_overflow=False
+            pulse_process = subprocess.Popen(
+                [
+                    "parec",
+                    "--device=@DEFAULT_SOURCE@",
+                    "--format=s16le",
+                    "--rate=16000",
+                    "--channels=1",
+                    "--raw"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
             )
 
-            # Convert microphone sample rate to 16 kHz.
+            start_time = time.monotonic()
 
-            if input_sample_rate != VOSK_SAMPLE_RATE:
+            while (
+                time.monotonic() - start_time
+                < MAX_LISTEN_SECONDS
+            ):
 
-                data, resample_state = audioop.ratecv(
-                    data,
-                    2,
-                    1,
-                    input_sample_rate,
-                    VOSK_SAMPLE_RATE,
-                    resample_state
+                data = pulse_process.stdout.read(
+                    CHUNK_SIZE * 2
                 )
 
-            if recognizer.AcceptWaveform(data):
+                if not data:
+                    break
+
+                if recognizer.AcceptWaveform(data):
+
+                    result = json.loads(
+                        recognizer.Result()
+                    )
+
+                    transcript = result.get(
+                        "text", ""
+                    ).strip()
+
+                    if transcript:
+                        break
+
+            if not transcript:
 
                 result = json.loads(
-                    recognizer.Result()
+                    recognizer.FinalResult()
                 )
 
                 transcript = result.get(
                     "text", ""
                 ).strip()
 
-                if transcript:
-                    break
+        else:
 
-        # Retrieve remaining recognized speech.
+            print("Using PyAudio system-default microphone")
 
-        if not transcript:
+            audio = pyaudio.PyAudio()
 
-            result = json.loads(
-                recognizer.FinalResult()
+            default_input = (
+                audio.get_default_input_device_info()
             )
 
-            transcript = result.get(
-                "text", ""
-            ).strip()
+            input_sample_rate = int(
+                default_input["defaultSampleRate"]
+            )
+
+            print(
+                "Using microphone:",
+                default_input["name"]
+            )
+
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=input_sample_rate,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
+
+            start_time = time.monotonic()
+            resample_state = None
+
+            while (
+                time.monotonic() - start_time
+                < MAX_LISTEN_SECONDS
+            ):
+
+                data = stream.read(
+                    CHUNK_SIZE,
+                    exception_on_overflow=False
+                )
+
+                if input_sample_rate != VOSK_SAMPLE_RATE:
+
+                    data, resample_state = audioop.ratecv(
+                        data,
+                        2,
+                        1,
+                        input_sample_rate,
+                        VOSK_SAMPLE_RATE,
+                        resample_state
+                    )
+
+                if recognizer.AcceptWaveform(data):
+
+                    result = json.loads(
+                        recognizer.Result()
+                    )
+
+                    transcript = result.get(
+                        "text", ""
+                    ).strip()
+
+                    if transcript:
+                        break
+
+            if not transcript:
+
+                result = json.loads(
+                    recognizer.FinalResult()
+                )
+
+                transcript = result.get(
+                    "text", ""
+                ).strip()
 
     except Exception as error:
 
@@ -347,7 +451,22 @@ def listen():
             stream.stop_stream()
             stream.close()
 
-        audio.terminate()
+        if audio is not None:
+            audio.terminate()
+
+        if pulse_process is not None:
+
+            pulse_process.terminate()
+
+            try:
+                pulse_process.wait(timeout=2)
+
+            except subprocess.TimeoutExpired:
+                pulse_process.kill()
+                pulse_process.wait()
+
+            if pulse_process.stdout:
+                pulse_process.stdout.close()
 
     if transcript:
 
@@ -442,14 +561,14 @@ def speak(text):
 
     try:
 
+        # Generate audio using Piper locally.
+
         with tempfile.NamedTemporaryFile(
             suffix=".wav",
             delete=False
         ) as temp:
 
             temp_file = temp.name
-
-        # Generate audio using Piper locally.
 
         with wave.open(temp_file, "wb") as wav_file:
 
@@ -458,14 +577,50 @@ def speak(text):
                 wav_file
             )
 
-        # Use Raspberry Pi's system-default ALSA output.
-        # No speaker index or device name is specified.
+        # First choice: system-default speaker.
 
-        subprocess.run(
-            ["aplay", "-q", "-D", "default", temp_file],
-            check=True,
-            timeout=90
-        )
+        played = False
+
+        if pulse_audio_available() and shutil.which("paplay"):
+
+            try:
+
+                subprocess.run(
+                    [
+                        "paplay",
+                        "--device=@DEFAULT_SINK@",
+                        temp_file
+                    ],
+                    check=True,
+                    timeout=90
+                )
+
+                played = True
+
+            except Exception as error:
+
+                print(
+                    "PulseAudio playback failed:",
+                    error
+                )
+
+        # Fallback: ALSA system-default speaker.
+
+        if not played:
+
+            print("Using ALSA default speaker.")
+
+            subprocess.run(
+                [
+                    "aplay",
+                    "-q",
+                    "-D",
+                    "default",
+                    temp_file
+                ],
+                check=True,
+                timeout=90
+            )
 
     except Exception as error:
 
@@ -496,13 +651,13 @@ def main():
     print("====================================")
 
     show_audio_devices()
+    get_default_audio_devices()
 
     # Introduce Padton.
 
     speak(
         "Hello there, friend! "
         "I'm Padton the Bear! "
-        "Would you like to talk about Christmas?"
     )
 
     while True:
@@ -545,7 +700,7 @@ def main():
                 speak(
                     "Goodbye, friend! "
                     "Have a wonderful day! "
-                    "Merry Christmas!"
+                    "Happy holidays!"
                 )
 
                 break
