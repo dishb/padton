@@ -3,3 +3,5 @@ voices/
 vosk-model-small-en-us-0.15/
 vosk-model-small-en-us-0.15.zip
 .env
+__pycache__/
+.DS_Store
