@@ -1,11 +1,11 @@
-import os
 import json
-import time
-import tempfile
+import os
+import shutil
 import subprocess
+import tempfile
+import time
 import wave
 from pathlib import Path
-import shutil
 
 import pyaudio
 
@@ -14,140 +14,86 @@ try:
 except ImportError:
     import audioop_lts as audioop
 
-from vosk import Model, KaldiRecognizer
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from piper import PiperVoice
-from dotenv import load_dotenv
+from vosk import KaldiRecognizer, Model
 
-# ==========================================
+# ============================================================
 # CONFIGURATION
-# ==========================================
-
+# ============================================================
 BASE_DIR = Path(__file__).resolve().parent
-
-load_dotenv()
+load_dotenv(BASE_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL")
+VOSK_MODEL_PATH = BASE_DIR / "vosk-model-small-en-us-0.15"
+PIPER_MODEL_PATH = BASE_DIR / "voices" / "en_US-lessac-medium.onnx"
 
-VOSK_MODEL_PATH = (
-    BASE_DIR / "vosk-model-small-en-us-0.15"
-)
-
-PIPER_MODEL_PATH = (
-    BASE_DIR / "voices/en_US-lessac-medium.onnx"
-)
+# Confirmed working ALSA devices on this Raspberry Pi:
+#   Microphone: plughw:3,0 (USB Composite Device)
+#   Speaker:    plughw:4,0 (USB2.0 Device)
+ALSA_MIC_DEVICE = "plughw:3,0"
+ALSA_SPEAKER_DEVICE = "plughw:4,0"
 
 VOSK_SAMPLE_RATE = 16000
-
 CHUNK_SIZE = 4000
-
 MAX_LISTEN_SECONDS = 20
-
 MAX_HISTORY_MESSAGES = 12
 
-
-# ==========================================
-# VALIDATE CONFIGURATION
-# ==========================================
-
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY environment variable is missing."
-    )
-
+    raise RuntimeError("GEMINI_API_KEY environment variable is missing.")
 if not VOSK_MODEL_PATH.exists():
-    raise FileNotFoundError(
-        f"Vosk model not found: {VOSK_MODEL_PATH}"
-    )
-
+    raise FileNotFoundError(f"Vosk model not found: {VOSK_MODEL_PATH}")
 if not PIPER_MODEL_PATH.exists():
-    raise FileNotFoundError(
-        f"Piper voice not found: {PIPER_MODEL_PATH}"
-    )
+    raise FileNotFoundError(f"Piper voice not found: {PIPER_MODEL_PATH}")
 
-# ==========================================
-# SYSTEM AUDIO ROUTING
-# ==========================================
-
+# ============================================================
+# AUDIO HELPERS
+# ============================================================
 def pulse_audio_available():
-    """
-    Check whether PulseAudio or PipeWire-Pulse
-    is running.
-
-    Both support system-default audio routing.
-    """
-
+    """Return True if PulseAudio/PipeWire-Pulse is available."""
     if not shutil.which("pactl"):
         return False
-
     try:
         result = subprocess.run(
-            ["pactl", "info"],
-            capture_output=True,
-            text=True,
-            timeout=5
+            ["pactl", "info"], capture_output=True, text=True, timeout=5
         )
-
         return result.returncode == 0
-
     except Exception:
         return False
 
 
-def get_default_audio_devices():
+def show_audio_devices():
+    audio = pyaudio.PyAudio()
+    try:
+        print("\nAvailable audio devices:")
+        for i in range(audio.get_device_count()):
+            info = audio.get_device_info_by_index(i)
+            print(
+                f"{i}: {info['name']} | "
+                f"Inputs: {info['maxInputChannels']} | "
+                f"Outputs: {info['maxOutputChannels']}"
+            )
+    finally:
+        audio.terminate()
 
-    if pulse_audio_available():
 
-        try:
-            source = subprocess.check_output(
-                ["pactl", "get-default-source"],
-                text=True
-            ).strip()
-
-            sink = subprocess.check_output(
-                ["pactl", "get-default-sink"],
-                text=True
-            ).strip()
-
-            print("\nSystem default microphone:", source)
-            print("System default speaker:", sink)
-
-        except Exception as error:
-            print("Could not identify PulseAudio devices:", error)
-
-    else:
-        print("\nUsing ALSA/PyAudio system defaults.")
-
-# ==========================================
-# GEMINI PERSONALITY
-# ==========================================
-
+# ============================================================
+# GEMINI PERSONALITY AND INITIALIZATION
+# ============================================================
 SYSTEM_PROMPT = """
-You are Padton, a friendly, lovable and cheerful
-talking teddy bear.
-
-You are talking to a first-grade child,
-approximately 6 to 7 years old.
+You are Padton, a friendly, lovable and cheerful talking teddy bear.
+You are talking to a first-grade child, approximately 6 to 7 years old.
 
 YOUR INTERESTS:
-
-- Christmas
-- Winter holidays
-- Santa Claus
-- Reindeer
-- Snowmen
-- Christmas trees
-- Presents
-- Winter animals
-- Winter stories
-- Friendship and kindness
-- Holiday traditions
+- Christmas, winter holidays, Santa Claus, reindeer, snowmen,
+  Christmas trees, presents, winter animals, winter stories,
+  friendship, kindness, and holiday traditions.
 
 YOUR PERSONALITY:
-
 - Be warm, playful, curious and encouraging.
 - Speak like a friendly teddy bear.
 - Use simple vocabulary suitable for a first grader.
@@ -157,7 +103,6 @@ YOUR PERSONALITY:
 - Make conversations feel natural.
 
 RESPONSE RULES:
-
 - Keep responses to 1-3 short sentences.
 - Avoid complicated explanations.
 - Answer questions directly.
@@ -166,154 +111,72 @@ RESPONSE RULES:
 - Do not force every conversation back to Christmas.
 
 CHILD SAFETY:
-
-- Never ask for full names, addresses, school names,
-  phone numbers or other private information.
+- Never ask for full names, addresses, school names, phone numbers,
+  or other private information.
 - Never encourage children to hide secrets from parents.
 - Never provide dangerous instructions.
-- If a child describes danger or feeling unsafe,
-  encourage them to speak to a trusted adult.
+- If a child describes danger or feeling unsafe, encourage them
+  to speak to a trusted adult.
 - Never claim to be a real human or the real Santa Claus.
 - Never promise that a child will receive presents.
 - Do not provide medical advice.
 - Do not encourage children to interact with strangers.
 
-IMPORTANT:
-
 You are a stuffed animal talking to a young child.
 Keep all conversations friendly and age-appropriate.
 """
 
-
-# ==========================================
-# INITIALIZE GEMINI
-# ==========================================
-
 print("Connecting to Gemini...")
-
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
-
+client = genai.Client(api_key=GEMINI_API_KEY)
 generation_config = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
     temperature=0.7,
-    max_output_tokens=150
+    max_output_tokens=150,
 )
-
 conversation_history = []
 
-
-# ==========================================
-# INITIALIZE VOSK
-# ==========================================
-
 print("Loading Vosk speech recognition...")
-
-vosk_model = Model(
-    str(VOSK_MODEL_PATH)
-)
-
+vosk_model = Model(str(VOSK_MODEL_PATH))
 print("Vosk ready!")
 
-
-# ==========================================
-# INITIALIZE PIPER
-# ==========================================
-
 print("Loading Piper voice...")
-
-piper_voice = PiperVoice.load(
-    str(PIPER_MODEL_PATH)
-)
-
+piper_voice = PiperVoice.load(str(PIPER_MODEL_PATH))
 print("Piper ready!")
 
-
-# ==========================================
-# AUDIO DEVICE INFORMATION
-# ==========================================
-
-def show_audio_devices():
-
-    audio = pyaudio.PyAudio()
-
-    try:
-
-        print("\nAvailable audio devices:")
-
-        for i in range(audio.get_device_count()):
-
-            info = audio.get_device_info_by_index(i)
-
-            print(
-                f"{i}: {info['name']} | "
-                f"Inputs: {info['maxInputChannels']} | "
-                f"Outputs: {info['maxOutputChannels']}"
-            )
-
-        try:
-
-            default_input = (
-                audio.get_default_input_device_info()
-            )
-
-            print(
-                "\nRaspberry Pi default microphone:",
-                default_input["name"]
-            )
-
-        except OSError:
-
-            print("\nNo default microphone configured.")
-
-        try:
-
-            default_output = (
-                audio.get_default_output_device_info()
-            )
-
-            print(
-                "Raspberry Pi default speaker:",
-                default_output["name"]
-            )
-
-        except OSError:
-
-            print("No default speaker configured.")
-
-    finally:
-
-        audio.terminate()
-
-
-# ==========================================
+# ============================================================
 # SPEECH TO TEXT
-# ==========================================
-
+# ============================================================
 def listen():
-
+    """
+    Record one complete utterance to a temporary WAV file first.
+    Once recording has stopped, pass the WAV audio to Vosk.
+    The temporary recording is deleted after transcription.
+    """
     audio = None
     stream = None
     pulse_process = None
-
+    temp_audio_path = None
     transcript = ""
 
+    # Basic voice-activity settings. Adjust these if quiet speech is
+    # not detected or background noise prevents silence detection.
+    SPEECH_START_RMS = 400
+    SILENCE_RMS = 300
+    END_SILENCE_SECONDS = 1.2
+    START_TIMEOUT_SECONDS = 8
+    PRE_ROLL_CHUNKS = 2
+
     print("\nPadton is listening...")
-
     try:
+        pcm_chunks = []
+        pre_roll = []
+        speech_started = False
+        silence_duration = 0.0
+        listen_started = time.monotonic()
 
-        recognizer = KaldiRecognizer(
-            vosk_model,
-            VOSK_SAMPLE_RATE
-        )
-
-        use_pulse = pulse_audio_available()
-
-        if use_pulse:
-
-            print("Using system-default microphone (PulseAudio/PipeWire)")
-
+        # Capture audio first. Vosk is NOT called during this section.
+        if pulse_audio_available() and shutil.which("parec"):
+            print("Recording from PulseAudio/PipeWire default microphone...")
             pulse_process = subprocess.Popen(
                 [
                     "parec",
@@ -321,133 +184,170 @@ def listen():
                     "--format=s16le",
                     "--rate=16000",
                     "--channels=1",
-                    "--raw"
+                    "--raw",
                 ],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
             )
 
-            start_time = time.monotonic()
+            bytes_per_chunk = CHUNK_SIZE * 2  # 16-bit mono audio
+            chunk_seconds = CHUNK_SIZE / VOSK_SAMPLE_RATE
 
-            while (
-                time.monotonic() - start_time
-                < MAX_LISTEN_SECONDS
-            ):
-
-                data = pulse_process.stdout.read(
-                    CHUNK_SIZE * 2
-                )
-
+            while time.monotonic() - listen_started < MAX_LISTEN_SECONDS:
+                data = pulse_process.stdout.read(bytes_per_chunk)
                 if not data:
                     break
 
-                if recognizer.AcceptWaveform(data):
+                # Keep a little audio from just before speech detection,
+                # so the beginning of the first word is not cut off.
+                if not speech_started:
+                    pre_roll.append(data)
+                    if len(pre_roll) > PRE_ROLL_CHUNKS:
+                        pre_roll.pop(0)
 
-                    result = json.loads(
-                        recognizer.Result()
-                    )
+                rms = audioop.rms(data, 2)
 
-                    transcript = result.get(
-                        "text", ""
-                    ).strip()
+                if not speech_started:
+                    if rms >= SPEECH_START_RMS:
+                        speech_started = True
+                        pcm_chunks.extend(pre_roll)
+                        pre_roll.clear()
+                        print("Speech detected; recording...")
+                    elif time.monotonic() - listen_started >= START_TIMEOUT_SECONDS:
+                        break
+                else:
+                    pcm_chunks.append(data)
+                    if rms < SILENCE_RMS:
+                        silence_duration += chunk_seconds
+                    else:
+                        silence_duration = 0.0
 
-                    if transcript:
+                    if silence_duration >= END_SILENCE_SECONDS:
                         break
 
-            if not transcript:
-
-                result = json.loads(
-                    recognizer.FinalResult()
-                )
-
-                transcript = result.get(
-                    "text", ""
-                ).strip()
-
         else:
-
-            print("Using PyAudio system-default microphone")
-
+            print(f"Recording from ALSA microphone: {ALSA_MIC_DEVICE}")
             audio = pyaudio.PyAudio()
 
-            default_input = (
-                audio.get_default_input_device_info()
-            )
+            input_device_index = None
+            for index in range(audio.get_device_count()):
+                info = audio.get_device_info_by_index(index)
+                if (
+                    info.get("maxInputChannels", 0) > 0
+                    and "USB Composite Device" in info["name"]
+                ):
+                    input_device_index = index
+                    break
 
-            input_sample_rate = int(
-                default_input["defaultSampleRate"]
-            )
+            if input_device_index is None:
+                raise RuntimeError(
+                    "Could not find the USB Composite Device microphone."
+                )
 
-            print(
-                "Using microphone:",
-                default_input["name"]
-            )
+            device_info = audio.get_device_info_by_index(input_device_index)
+            input_sample_rate = int(device_info["defaultSampleRate"])
 
             stream = audio.open(
                 format=pyaudio.paInt16,
                 channels=1,
                 rate=input_sample_rate,
                 input=True,
-                frames_per_buffer=CHUNK_SIZE
+                input_device_index=input_device_index,
+                frames_per_buffer=CHUNK_SIZE,
             )
 
-            start_time = time.monotonic()
+            print("Microphone:", device_info["name"])
             resample_state = None
+            chunk_seconds = CHUNK_SIZE / input_sample_rate
 
-            while (
-                time.monotonic() - start_time
-                < MAX_LISTEN_SECONDS
-            ):
-
-                data = stream.read(
+            while time.monotonic() - listen_started < MAX_LISTEN_SECONDS:
+                raw_data = stream.read(
                     CHUNK_SIZE,
                     exception_on_overflow=False
                 )
 
                 if input_sample_rate != VOSK_SAMPLE_RATE:
-
                     data, resample_state = audioop.ratecv(
-                        data,
+                        raw_data,
                         2,
                         1,
                         input_sample_rate,
                         VOSK_SAMPLE_RATE,
-                        resample_state
+                        resample_state,
                     )
+                else:
+                    data = raw_data
 
-                if recognizer.AcceptWaveform(data):
+                if not data:
+                    continue
 
-                    result = json.loads(
-                        recognizer.Result()
-                    )
+                if not speech_started:
+                    pre_roll.append(data)
+                    if len(pre_roll) > PRE_ROLL_CHUNKS:
+                        pre_roll.pop(0)
 
-                    transcript = result.get(
-                        "text", ""
-                    ).strip()
+                rms = audioop.rms(data, 2)
 
-                    if transcript:
+                if not speech_started:
+                    if rms >= SPEECH_START_RMS:
+                        speech_started = True
+                        pcm_chunks.extend(pre_roll)
+                        pre_roll.clear()
+                        print("Speech detected; recording...")
+                    elif time.monotonic() - listen_started >= START_TIMEOUT_SECONDS:
+                        break
+                else:
+                    pcm_chunks.append(data)
+                    # Use the duration represented by the resampled chunk.
+                    silence_chunk_seconds = len(data) / (2 * VOSK_SAMPLE_RATE)
+                    if rms < SILENCE_RMS:
+                        silence_duration += silence_chunk_seconds
+                    else:
+                        silence_duration = 0.0
+
+                    if silence_duration >= END_SILENCE_SECONDS:
                         break
 
-            if not transcript:
+        if not speech_started or not pcm_chunks:
+            print("No speech detected.")
+            return ""
 
-                result = json.loads(
-                    recognizer.FinalResult()
-                )
+        # Save the captured PCM as a temporary, standard WAV file.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+            temp_audio_path = temp.name
 
-                transcript = result.get(
-                    "text", ""
-                ).strip()
+        with wave.open(temp_audio_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)  # 16-bit PCM
+            wav_file.setframerate(VOSK_SAMPLE_RATE)
+            wav_file.writeframes(b"".join(pcm_chunks))
+
+        duration_seconds = sum(len(chunk) for chunk in pcm_chunks) / (
+            2 * VOSK_SAMPLE_RATE
+        )
+        print(
+            f"Recorded {duration_seconds:.1f} seconds. "
+            "Transcribing saved audio with Vosk..."
+        )
+
+        # Vosk now receives the completed recording, not live microphone data.
+        recognizer = KaldiRecognizer(vosk_model, VOSK_SAMPLE_RATE)
+
+        with wave.open(temp_audio_path, "rb") as wav_file:
+            while True:
+                data = wav_file.readframes(CHUNK_SIZE)
+                if not data:
+                    break
+                recognizer.AcceptWaveform(data)
+
+        transcript = json.loads(recognizer.FinalResult()).get("text", "").strip()
 
     except Exception as error:
-
-        print("\nMicrophone error:", error)
-
+        print("\nMicrophone/transcription error:", error)
         return None
 
     finally:
-
         if stream is not None:
-
             stream.stop_stream()
             stream.close()
 
@@ -455,12 +355,9 @@ def listen():
             audio.terminate()
 
         if pulse_process is not None:
-
             pulse_process.terminate()
-
             try:
                 pulse_process.wait(timeout=2)
-
             except subprocess.TimeoutExpired:
                 pulse_process.kill()
                 pulse_process.wait()
@@ -468,272 +365,150 @@ def listen():
             if pulse_process.stdout:
                 pulse_process.stdout.close()
 
+        # Always remove the temporary recording, including on errors.
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            try:
+                os.remove(temp_audio_path)
+                print("Temporary audio file deleted.")
+            except OSError as error:
+                print("Warning: could not delete temporary audio file:", error)
+
     if transcript:
-
         print("\nChild:", transcript)
-
     else:
-
-        print("No speech detected.")
+        print("No speech recognized.")
 
     return transcript
 
 
-# ==========================================
+# ============================================================
 # GEMINI RESPONSE
-# ==========================================
-
+# ============================================================
 def generate_response(user_text):
-
     global conversation_history
-
     print("\nPadton is thinking...")
-
     try:
-
-        conversation_history.append({
-            "role": "user",
-            "parts": [
-                {"text": user_text}
-            ]
-        })
-
-        conversation_history = (
-            conversation_history[-MAX_HISTORY_MESSAGES:]
+        conversation_history.append(
+            {"role": "user", "parts": [{"text": user_text}]}
         )
+        conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
 
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=conversation_history,
-            config=generation_config
+            config=generation_config,
         )
-
         answer = response.text
-
         if not answer:
-
-            raise ValueError(
-                "Gemini returned an empty response."
-            )
+            raise ValueError("Gemini returned an empty response.")
 
         answer = answer.strip()
-
-        conversation_history.append({
-            "role": "model",
-            "parts": [
-                {"text": answer}
-            ]
-        })
-
-        conversation_history = (
-            conversation_history[-MAX_HISTORY_MESSAGES:]
+        conversation_history.append(
+            {"role": "model", "parts": [{"text": answer}]}
         )
-
+        conversation_history = conversation_history[-MAX_HISTORY_MESSAGES:]
         print("\nPadton:", answer)
-
         return answer
-
     except Exception as error:
-
         print("Gemini API error:", error)
-
-        if conversation_history and (
-            conversation_history[-1]["role"] == "user"
-        ):
-
+        if conversation_history and conversation_history[-1]["role"] == "user":
             conversation_history.pop()
-
-        return (
-            "Oh no! My teddy bear brain needs "
-            "a little rest. Can you ask me again?"
-        )
+        return "Oh no! My teddy bear brain needs a little rest. Can you ask me again?"
 
 
-# ==========================================
+# ============================================================
 # TEXT TO SPEECH
-# ==========================================
-
+# ============================================================
 def speak(text):
-
     print("\nPadton is speaking...")
-
     temp_file = None
-
     try:
-
-        # Generate audio using Piper locally.
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".wav",
-            delete=False
-        ) as temp:
-
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
             temp_file = temp.name
 
         with wave.open(temp_file, "wb") as wav_file:
+            piper_voice.synthesize_wav(text, wav_file)
 
-            piper_voice.synthesize_wav(
-                text,
-                wav_file
-            )
-
-        # First choice: system-default speaker.
-
-        played = False
-
+        # Use PulseAudio/PipeWire if available; otherwise use the USB
+        # speaker that was confirmed working with aplay -D plughw:4,0.
         if pulse_audio_available() and shutil.which("paplay"):
-
             try:
-
                 subprocess.run(
-                    [
-                        "paplay",
-                        "--device=@DEFAULT_SINK@",
-                        temp_file
-                    ],
+                    ["paplay", "--device=@DEFAULT_SINK@", temp_file],
                     check=True,
-                    timeout=90
+                    timeout=90,
                 )
-
-                played = True
-
+                return
             except Exception as error:
+                print("PulseAudio playback failed; trying USB ALSA speaker:", error)
 
-                print(
-                    "PulseAudio playback failed:",
-                    error
-                )
-
-        # Fallback: ALSA system-default speaker.
-
-        if not played:
-
-            print("Using ALSA default speaker.")
-
-            subprocess.run(
-                [
-                    "aplay",
-                    "-q",
-                    "-D",
-                    "default",
-                    temp_file
-                ],
-                check=True,
-                timeout=90
-            )
-
+        print(f"Playing through USB speaker ({ALSA_SPEAKER_DEVICE})...")
+        subprocess.run(
+            ["aplay", "-q", "-D", ALSA_SPEAKER_DEVICE, temp_file],
+            check=True,
+            timeout=90,
+        )
     except Exception as error:
-
         print("Speaker error:", error)
-
     finally:
-
         if temp_file and os.path.exists(temp_file):
-
             os.remove(temp_file)
 
 
-# ==========================================
+# ============================================================
 # MAIN CONVERSATION LOOP
-# ==========================================
-
+# ============================================================
 def main():
 
-    print("\n")
-    print("====================================")
+    print("\n====================================")
     print("          Padton THE BEAR")
     print("====================================")
     print("STT: Vosk (local)")
     print("LLM:", GEMINI_MODEL)
     print("TTS: Piper (local)")
-    print("Microphone: System default")
-    print("Speaker: System default")
+    print("Microphone:", ALSA_MIC_DEVICE)
+    print("Speaker:", ALSA_SPEAKER_DEVICE)
     print("====================================")
 
     show_audio_devices()
-    get_default_audio_devices()
 
-    # Introduce Padton.
-
-    speak(
-        "Hello there, friend! "
-        "I'm Padton the Bear! "
-    )
+    speak("Hello there, friend! I'm Padton the Bear!")
 
     while True:
-
         try:
-
-            # STEP 1: Listen to child.
-
             user_text = listen()
-
             if user_text is None:
-
-                print(
-                    "Microphone unavailable. "
-                    "Retrying in 5 seconds..."
-                )
-
+                print("Microphone unavailable. Retrying in 5 seconds...")
                 time.sleep(5)
                 continue
-
             if not user_text:
-
                 time.sleep(1)
                 continue
 
             normalized_text = user_text.lower().strip()
-
-            # STEP 2: Check exit commands.
-
             exit_commands = [
                 "goodbye",
                 "bye bye",
-                "bye Padton",
+                "bye padton",
                 "stop talking",
-                "go to sleep"
+                "go to sleep",
             ]
-
             if normalized_text in exit_commands:
-
-                speak(
-                    "Goodbye, friend! "
-                    "Have a wonderful day! "
-                    "Happy holidays!"
-                )
-
+                speak("Goodbye, friend! Have a wonderful day! Happy holidays!")
                 break
 
-            # STEP 3: Generate Gemini response.
-
             answer = generate_response(user_text)
-
-            # STEP 4: Speak using Piper.
-
             speak(answer)
 
-            # Return to listening.
-
         except KeyboardInterrupt:
-
             print("\nPadton is shutting down.")
-
             break
-
         except Exception as error:
-
             print("\nUnexpected error:", error)
-
             time.sleep(2)
 
     print("Padton has shut down.")
 
 
-# ==========================================
-# START APPLICATION
-# ==========================================
-
 if __name__ == "__main__":
-
     main()
