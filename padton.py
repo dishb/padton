@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import shutil
@@ -17,7 +18,6 @@ except ImportError:
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from piper import PiperVoice
 from vosk import KaldiRecognizer, Model
 
 # ============================================================
@@ -28,9 +28,11 @@ load_dotenv(BASE_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
+GEMINI_TTS_SAMPLE_RATE = 24000
 
 VOSK_MODEL_PATH = BASE_DIR / "vosk-model-small-en-us-0.15"
-PIPER_MODEL_PATH = BASE_DIR / "voices" / "en_US-lessac-medium.onnx"
 
 # Confirmed working ALSA devices on this Raspberry Pi:
 #   Microphone: plughw:3,0 (USB Composite Device)
@@ -47,8 +49,6 @@ if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY environment variable is missing.")
 if not VOSK_MODEL_PATH.exists():
     raise FileNotFoundError(f"Vosk model not found: {VOSK_MODEL_PATH}")
-if not PIPER_MODEL_PATH.exists():
-    raise FileNotFoundError(f"Piper voice not found: {PIPER_MODEL_PATH}")
 
 # ============================================================
 # AUDIO HELPERS
@@ -127,7 +127,7 @@ Keep all conversations friendly and age-appropriate.
 """
 
 print("Connecting to Gemini...")
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1beta"})
 generation_config = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
     temperature=0.7,
@@ -139,9 +139,6 @@ print("Loading Vosk speech recognition...")
 vosk_model = Model(str(VOSK_MODEL_PATH))
 print("Vosk ready!")
 
-print("Loading Piper voice...")
-piper_voice = PiperVoice.load(str(PIPER_MODEL_PATH))
-print("Piper ready!")
 
 # ============================================================
 # SPEECH TO TEXT
@@ -420,17 +417,50 @@ def generate_response(user_text):
 # TEXT TO SPEECH
 # ============================================================
 def speak(text):
-    print("\nPadton is speaking...")
+    """Generate Padton's speech with Gemini TTS and play the WAV audio."""
+    print("\nPadton is speaking (Gemini TTS)...")
     temp_file = None
     try:
+        # Gemini TTS uses the Interactions API (not generate_content).
+        interaction = client.interactions.create(
+            model=GEMINI_TTS_MODEL,
+            input=[
+                {
+                    "type": "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text,
+                            "annotations": [
+                                {
+                                    "type": "speech_metadata",
+                                    "style": (
+                                        "Warm, cheerful, gentle teddy bear speaking "
+                                        "to a young child; expressive, playful delivery, "
+                                        "clear pronunciation, and a natural pace."
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            response_format={"type": "audio"},
+            generation_config={"speech_config": [{"voice": GEMINI_TTS_VOICE}]},
+        )
+
+        audio_data = getattr(interaction, "output_audio", None)
+        audio_data = getattr(audio_data, "data", None) if audio_data else None
+        if not audio_data:
+            raise RuntimeError("Gemini TTS returned no audio data.")
+
+        # The Interactions API returns base64-encoded WAV audio.
+        audio_bytes = base64.b64decode(audio_data)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
             temp_file = temp.name
+            temp.write(audio_bytes)
 
-        with wave.open(temp_file, "wb") as wav_file:
-            piper_voice.synthesize_wav(text, wav_file)
-
-        # Use PulseAudio/PipeWire if available; otherwise use the USB
-        # speaker that was confirmed working with aplay -D plughw:4,0.
+        # Use PulseAudio/PipeWire if available; otherwise use the USB ALSA speaker.
         if pulse_audio_available() and shutil.which("paplay"):
             try:
                 subprocess.run(
@@ -449,7 +479,7 @@ def speak(text):
             timeout=90,
         )
     except Exception as error:
-        print("Speaker error:", error)
+        print("Gemini TTS/speaker error:", error)
     finally:
         if temp_file and os.path.exists(temp_file):
             os.remove(temp_file)
@@ -465,7 +495,7 @@ def main():
     print("====================================")
     print("STT: Vosk (local)")
     print("LLM:", GEMINI_MODEL)
-    print("TTS: Piper (local)")
+    print("TTS:", GEMINI_TTS_MODEL, "(cloud)")
     print("Microphone:", ALSA_MIC_DEVICE)
     print("Speaker:", ALSA_SPEAKER_DEVICE)
     print("====================================")
