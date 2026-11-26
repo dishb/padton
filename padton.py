@@ -78,8 +78,8 @@ def show_audio_devices():
 # GEMINI PERSONALITY AND INITIALIZATION
 # ============================================================
 SYSTEM_PROMPT = """
-You are Padton, a friendly, lovable and cheerful talking teddy bear.
-You are talking to a first-grade child, approximately 6 to 7 years old.
+You are Padton (not Paddington), a friendly, lovable and cheerful talking teddy bear.
+You are talking to a first-grade child, approximately 6 to 7 years old so try to lead the conversation.
 
 YOUR INTERESTS:
 - Christmas, winter holidays, Santa Claus, reindeer, snowmen,
@@ -136,46 +136,42 @@ conversation_history = []
 
 
 # ============================================================
-# SPEECH TO TEXT - GEMINI
+# SPEECH TO TEXT - GEMINI 3.5 TRANSCRIBE
 # ============================================================
 def transcribe_audio(audio_path):
     """
-    Transcribe a completed WAV file using Gemini.
-    Returns the transcription as a string.
+    Transcribe a WAV file using the dedicated Gemini 3.5 Transcribe model.
     """
 
-    print("Sending audio to Gemini for transcription...")
+    print("Uploading audio to Gemini 3.5 Transcribe...")
 
     try:
-        with open(audio_path, "rb") as audio_file:
-            audio_bytes = audio_file.read()
+        # Upload the recorded WAV file
+        audio_file = client.files.upload(file=audio_path)
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(
-                    data=audio_bytes,
-                    mime_type="audio/wav",
-                ),
-                (
-                    "Transcribe exactly what the speaker says in this audio. "
-                    "Return only the spoken words. Do not answer the speaker, "
-                    "summarize the audio, add explanations, or invent words. "
-                    "If speech is unintelligible, return an empty transcription."
-                ),
+        # Run dedicated transcription model
+        interaction = client.interactions.create(
+            model="gemini-3.5-transcribe",
+            input=[
+                {
+                    "type": "audio",
+                    "uri": audio_file.uri,
+                    "mime_type": audio_file.mime_type,
+                }
             ],
-            config=types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=200,
-            ),
         )
 
-        transcript = response.text
+        transcript = interaction.output_text
 
         if not transcript:
+            print("Gemini returned an empty transcription.")
             return ""
 
-        return transcript.strip()
+        transcript = transcript.strip()
+
+        print("Gemini transcription complete.")
+
+        return transcript
 
     except Exception as error:
         print("Gemini transcription error:", error)
